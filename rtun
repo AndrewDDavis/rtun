@@ -1,0 +1,279 @@
+#!/bin/bash
+
+# Andrew Davis
+# v1.2 -- Dec 2025 -- refactor and track on gitHub
+# v1.1.1 -- Aug 2011
+
+: """Open an SSH tunnel to a target machine through an intermediary
+
+   Usage: rtun <target> [options ...]
+
+   Create a config file at ~/.config/rtun/rtun.conf. The file is made of blocks
+   for each target, separated by blank lines. A block comprises lines like:
+
+       [targetName]
+       name1 = value1
+       name2 = value2
+
+   The following names are usually required:
+
+     tgtUser: login name on the target machine
+     tgtLoc: IP or URL of target machine
+     tgtPort: port to access on target machine (e.g. 22=SSH, 80=HTTP)
+     lport: port to open on local machine (an unused port above 1024)
+     tunUser: login name on intermediary machine
+     tunLoc: URL or IP of intermediary machine
+     tunPort: port on intermediary machine
+
+   The tun names may be omitted for a block, to define a SOCKS tunnel.
+
+   Options:
+         -v : verbose mode for ssh connection
+      --ssh : initiate default ssh connection through the tunnel
+     --sshX : initiate ssh connection with -X option
+     --sftp : initiate default sftp connection through the tunnel
+    --sshfs : initiate default sshfs connection through the tunnel
+"""
+
+# fail on unset vars and non-zero returns
+set -o nounset
+set -o pipefail
+
+trap 'exit' ERR
+
+[[ -f $HOME/.bash_script_messages ]] \
+   && source "$HOME"/.bash_script_messages \
+   || { echo "Error: $(basename $0) requires .bash_script_messages to run."; exit 6; }
+
+getConfig() {
+
+   while read -r ln
+   do
+      n=${ln%%=*}
+      v=${ln#*=}
+      cfg["$n"]=$v
+
+   done < <(
+      awk -v "target=${target}" -- '
+         $0 ~ "^\\[" target "\\][[:blank:]]*$" {
+
+            # matched target block
+            match($0, /^\[[^\]]+/)
+            print "tgtName=" substr($0, RSTART + 1, RLENGTH - 1)
+            getline
+
+            while ( $0 !~ "^[[:blank:]]*$" ) {
+               # non-blank line
+               if ( $0 !~ "^[[:blank:]]*#" ) {
+                  # non-comment line
+                  sub("[[:blank:]]*=[[:blank:]]*","=")
+                  print
+               }
+               getline
+            }
+            matched = 1
+         }
+         END {
+            if ( matched != 1 ) exit 1
+         }
+      ' ~/.config/rtun/rtun.conf
+   )
+
+   # Check for configured target
+   [[ -n ${cfg[tgtName]-} ]] \
+      || { scriptErr "target not found"; exit 55; }
+
+   # without tunLoc, must be a SOCKS proxy
+   [[ -v cfg[tunLoc] ]] \
+      || socks=1
+}
+
+getExtIP() {
+
+   extIP=$( curl --connect-timeout 3 --max-time 10 \
+      'http://checkip.dyndns.com' 2>/dev/null \
+      | sed -E 's/[^0-9]*([0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}).*/\1/' ) \
+      || { extIPfail=1; }
+
+   if [[ -z "$extIP" ]] \
+      || [[ ! "$extIP" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]
+   then
+      extIP=$(curl --connect-timeout 3 --max-time 10 \
+         'http://ipdetect.dnspark.com/' 2>/dev/null \
+         | grep "Current Address:" \
+         | sed -E "s/.*Address: ([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+).*/\1/") \
+         || { extIPfail=1; }
+   fi
+
+   if [[ -z "$extIP" ]] \
+      || [[ ! "$extIP" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]
+   then
+      scriptWarn "external IP could not be determined"
+      extIP=""
+
+   else
+      scriptMsg "The external IP of this machine is ${extIP}."
+   fi
+}
+
+setTimeout() {
+
+   # give web and proxy users 8 hours
+   if [[ ${cfg[tgtPort]} -eq 80 \
+      || -v socks ]]
+   then
+      timeout=28800  # 8 hours
+   else
+      timeout=1800   # 30 minutes
+   fi
+
+   if (( timeout < 3600 ))
+   then
+      timeoutStr="$( bc <<< "scale=0; $timeout/60" ) minutes"
+   else
+      timeoutStr="$( bc <<< "scale=0; $timeout/(60*60)" ) hours"
+   fi
+}
+
+initConnect() {
+
+   # make the requested connection
+   case $init in
+      ( ssh )
+         exec ssh -p ${cfg[lport]} "${cfg[tgtUser]}@localhost" ;;
+      ( sshX )
+         exec ssh -X -p ${cfg[lport]} "${cfg[tgtUser]}@localhost" ;;
+      ( sftp )
+         exec sftp -o port=${cfg[lport]} "${cfg[tgtUser]}@localhost" ;;
+      ( sshfs )
+         exec sshfs -p ${cfg[lport]} "${cfg[tgtUser]}@localhost:." ~/.sshfs \
+            -o "volname=${cfg[tgtName]}" -o workaround=nonodelay ;;
+   esac
+}
+
+checkPort() {
+
+   # verify port is available
+   # - could also use netstat -anltp | grep "LISTEN"
+   if [[ -n $( nc -z 127.0.0.1 "${cfg[lport]}" ) ]] \
+         || [[ -n $( lsof -i :"${cfg[lport]}" ) ]]
+   then
+      scriptWarn "port ${cfg[lport]} is in use"
+      if [[ -v init ]]
+      then
+         initConnect
+
+      else
+         if [[ -v socks ]]
+         then
+            scriptMsg "proxy appears to be up on local port ${cfg[lport]}"
+
+         elif [ ${cfg[tgtPort]} -eq 80 ]
+         then
+            scriptMsg "site appears to be up at http://localhost:${cfg[lport]}"
+
+         else
+            scriptErr "specify a method to attempt connection."
+            scriptMsg "or: rsync --rsh \"ssh -o port=${cfg[lport]}\" ${cfg[tgtUser]}@localhost:remotepath ..."
+            exit 2
+         fi
+         exit 0
+      fi
+   fi
+}
+
+openTunnel() {
+
+   scriptMsg "Opening tunnel to ${cfg[tgtName]} on local port ${cfg[lport]}."
+
+   [[ -v verbArg ]] \
+      && ssh_args=( -v )
+
+   if [[ -v socks ]]
+   then
+      ssh_args+=( -fD "${cfg[lport]}" )
+      ssh_args+=( "${cfg[tgtUser]}@${cfg[tgtLoc]}" )
+      ssh_args+=( sleep $timeout )
+
+   else
+      ssh_args+=( -fL "${cfg[lport]}:${cfg[tgtLoc]}:${cfg[tgtPort]}" )
+      ssh_args+=( -p "${cfg[tunPort]}" )
+      ssh_args+=( "${cfg[tunUser]}@${cfg[tunLoc]}" )
+      ssh_args+=( sleep $timeout )
+   fi
+
+   ssh "${ssh_args[@]}" \
+      || { scriptErr "Failed to establish tunnel"; exit 5; }
+}
+
+useTunnel() {
+
+   if [[ -v init ]]
+   then
+      initConnect
+
+   else
+      scriptMsg "Possible commands:"
+
+      if [ ${cfg[tgtPort]} -eq 80 ]
+      then
+         scriptMsg "  http://localhost:${cfg[lport]}"
+
+      elif [[ -v socks ]]
+      then
+         scriptMsg "  SOCKS proxy opened on local port ${cfg[lport]}"
+
+      else
+         scriptMsg "  ssh -p ${cfg[lport]} ${cfg[tgtUser]}@localhost"
+         scriptMsg "  sftp -o port=${cfg[lport]} ${cfg[tgtUser]}@localhost"
+         scriptMsg "  yafc sftp://${cfg[tgtUser]}@localhost:${cfg[lport]}"
+         scriptMsg "  scp -o port=${cfg[lport]} ${cfg[tgtUser]}@localhost:remotepath ./"
+         scriptMsg "  rsync -n --rsh \"ssh -o port=${cfg[lport]}\" --delete --exclude \".~lock*\" --exclude \".DS_Store\" -ahP ${cfg[tgtUser]}@localhost:remotepath ./"
+         scriptMsg "  sshfs -p ${cfg[lport]} ${cfg[tgtUser]}@localhost:. ~/.sshfs -o volname=${cfg[tgtName]} -o workaround=nonodelay"
+      fi
+      scriptMsg "You have $timeoutStr to initate connections before the tunnel closes."
+   fi
+}
+
+# Defaults and arguments
+declare verbArg init socks target
+
+[[ $# -eq 0 || $1 == @(-h|--help) ]] \
+   && { docsh -TD; exit 0; }
+
+while (( $# > 0 ))
+do
+   case $1 in
+      ( --ssh ) init=ssh ;;
+      ( --sshX ) init=sshX ;;
+      ( --sftp ) init=sftp ;;
+      ( --sshfs ) init=sshfs ;;
+      ( -v ) verbArg=1 ;;
+      ( * )
+         [[ ! -v target ]] \
+            && target=$1 \
+            || { scriptErr "Arg not recognized: '$1'"; exit 3; }
+      ;;
+   esac
+   shift
+done
+
+# Parse config file with awk
+declare -A cfg
+getConfig
+
+# Obtain external IP address
+getExtIP
+
+# Set timeout
+declare -i timeout
+setTimeout
+
+# Make connection or abort if tunnel is already open
+checkPort
+
+# Open SSH tunnel
+openTunnel
+
+# Initialize connection or suggest options
+useTunnel

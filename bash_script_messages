@@ -1,0 +1,75 @@
+# Attribute codes:
+# 00=none 01=bold 04=underscore 05=blink 07=reverse 08=concealed
+# Text color codes:
+# 30=black 31=red 32=green 33=yellow 34=blue 35=magenta 36=cyan 37=white
+# Background color codes:
+# 40=black 41=red 42=green 43=yellow 44=blue 45=magenta 46=cyan 47=white
+#
+# eg.: bold, red text: \033[01;31m
+
+# Define output functions to use in scripts.  Use with scriptMsg 'message text' 'additional flags'
+function scriptWarn {            # yellow warnings
+   [ $# -gt 0 ] &&\
+      echo -e $([ $# -gt 1 ] && printf -- "$2") "\033[01m$(basename -- $0)\033[00m: \033[33mWarning: ${1}\033[00m" ||\
+      { echo -e "\033[01m$(basename -- $0)\033[00m: \033[31mError: $FUNCNAME requires at least one argument\033[00m" && return 1; }
+}
+function scriptErr {             # red errors
+   [ $# -gt 0 ] &&\
+      echo -e $([ $# -gt 1 ] && printf -- "$2") "\033[01m$(basename -- $0)\033[00m: \033[31mError: ${1}\033[00m" ||\
+      { echo -e "\033[01m$(basename -- $0)\033[00m: \033[31mError: $FUNCNAME requires at least one argument\033[00m" && return 1; }
+}
+function scriptMsg {             # messages in bold
+   [ $# -gt 0 ] &&\
+      echo -e $([ $# -gt 1 ] && printf -- "$2") "\033[01m$(basename -- $0)\033[00m: ${1}" ||\
+      { echo -e "\033[01m$(basename -- $0)\033[00m: \033[31mError: $FUNCNAME requires at least one argument\033[00m" && return 1; }
+}
+function scriptMsgr {            # messages that overwrite themselves
+   [ $# -gt 0 ] &&\
+      echo -e $([ $# -gt 1 ] && printf -- "$2") "\r\033[01m$(basename -- $0)\033[00m: ${1}" ||\
+      { echo -e "\033[01m$(basename -- $0)\033[00m: \033[31mError: $FUNCNAME requires at least one argument\033[00m" && return 1; }
+}
+function scriptEmph {            # blue emphasis
+   [ $# -gt 0 ] &&\
+      echo -e $([ $# -gt 1 ] && printf -- "$2") "\033[01m$(basename -- $0)\033[00m: \033[34m${1}\033[00m" ||\
+      { echo -e "\033[01m$(basename -- $0)\033[00m: \033[31mError: $FUNCNAME requires at least one argument\033[00m" && return 1; }
+}
+function scriptDebug {           # magenta debug messages
+   [ $# -gt 0 ] &&\
+      echo -e $([ $# -gt 1 ] && printf -- "$2") "\033[01m$(basename -- $0)\033[00m: \033[35m${1}\033[00m" ||\
+      { echo -e "\033[01m$(basename -- $0)\033[00m: \033[31mError: $FUNCNAME requires at least one argument\033[00m" && return 1; }
+}
+
+# One function to rule them all
+function scriptEcho {
+   [ $# -eq 0 ] && { scriptEcho -e "$FUNCNAME requires at least one argument" && return 1; }
+   local SEcolorCode=""; local SEalert=""; local SEowCode=""; local SEnlCode=""; local SEloggerFlag=""; local SElogFile=""; local SEmsgtxt=""
+   while [ $# -gt 1 ]; do
+      case $1 in
+         -b ) SEcolorCode="\033[34m";;                         # blue emphasis
+         -d ) SEcolorCode="\033[35m";;                         # magenta debug
+         -e ) SEcolorCode="\033[31m"; SEalert="Error: ";;      # red error
+         -f ) SElogFile="$2"; shift;;                          # also write message to file
+         -l ) SEloggerFlag=1;;                                 # also output message with logger
+         -n ) SEnlCode="-n";;                                  # no new line after echo
+         -r ) SEowCode="\r";;                                  # message will overwrite previous
+         -w ) SEcolorCode="\033[33m"; SEalert="Warning: ";;    # yellow warning
+         -- ) shift; break 1;;                                 # end of options
+          * ) scriptEcho -e "unrecognized argument to $FUNCNAME: $1" && return 1;;
+      esac
+      shift
+   done
+   function SEmain {
+      echo -e $SEnlCode "${SEowCode}\033[01m$(basename -- $0)\033[00m: ${SEcolorCode}${SEalert}${SEmsgtxt}\033[00m"
+      [ "$SEloggerFlag" ] && logger -t "$(basename -- $0)" "${SEalert}$SEmsgtxt"
+      [ "$SElogFile" ] && { [ -f "$SElogFile" ] && echo "${SEalert}$SEmsgtxt" >> "$SElogFile" || { scriptEcho -e "$FUNCNAME: file not found: $SElogFile" && return 1; } }
+      (exit 0)    # return 0, and work-around bash bug on einstein
+   }
+   if [[ $1 = "-" ]]; then
+      while read SEmsgtxt; do SEmain; done
+   else
+      while [ $# -gt 0 ]; do 
+         SEmsgtxt="$1" && SEmain
+         shift
+      done
+   fi
+}
